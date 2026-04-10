@@ -78,21 +78,47 @@ readarray -t CANDIDATES < <(lsblk -dn -o NAME,SIZE,TYPE,RO 2>/dev/null | while r
     echo "$name ${gb}G"
 done)
 
-# === 7. MODE SELECTION ===
+# === 7. MODE SELECTION (FIXED) ===
 if [[ -z "$MODE" ]]; then
-    echo -e "\n╔════════════════════════════╗\n║  🎯 Pi5 Agent Stack — Stage 1  ║\n╠════════════════════════════╣"
-    echo "║  RAM: ${RAM_GB}GB | Root: $ROOT_DISK"
-    echo "║  External: ${CANDIDATES[*]:-none}"
-    echo "╠════════════════════════════╣\n║  [A] 🏭 Production (NVMe/SSD)\n║  [B] 🧪 Testing (SD + zram)\n╚════════════════════════════╝\n"
+    # Печать меню через heredoc (надёжнее, чем echo -e)
+    cat <<MENU
+
+╔════════════════════════════╗
+║  🎯 Pi5 Agent Stack — Stage 1  ║
+╠════════════════════════════╣
+║  RAM: ${RAM_GB}GB | Root: $ROOT_DISK
+║  External: ${CANDIDATES[*]:-none}
+╠════════════════════════════╣
+║  [A] 🏭 Production (NVMe/SSD)
+║  [B] 🧪 Testing (SD + zram)
+╚════════════════════════════╝
+
+MENU
+
     if [[ "${CANDIDATES[*]:-none}" == "none" ]]; then
-        read -rp "No external disk. Continue in [B]? [y/N]: " c; [[ "$c" =~ ^[Yy] ]] || die "Aborted"
-        MODE="testing"
+        # Более надёжная проверка через case + отладочный лог
+        read -rp "⚠️  No external disk. Continue in [B] Testing mode? [y/N]: " c
+        log "DEBUG: user input for mode B confirmation: '$c'"
+        case "${c,,}" in  # ${c,,} = lowercase conversion (bash 4+)
+            y|yes) MODE="testing" ;;
+            *) die "Aborted. Connect NVMe/SSD for Production mode or type 'y' to continue Testing." ;;
+        esac
     else
-        read -rp "Select A or B: " c
-        case "$c" in [Aa]) MODE="production";; [Bb]) read -rp "⚠️ Confirm SD wear risk? [y/N]: " r; [[ "$r" =~ ^[Yy] ]] || die "Aborted"; MODE="testing";; *) die "Invalid";; esac
+        read -rp "Select mode (A/B): " c
+        case "${c,,}" in
+            a|production) MODE="production" ;;
+            b|testing) 
+                read -rp "⚠️  Confirm: SD card wear risk accepted? [y/N]: " r
+                case "${r,,}" in
+                    y|yes) MODE="testing" ;;
+                    *) die "Aborted" ;;
+                esac
+                ;;
+            *) die "Invalid choice. Use --mode=a or --mode=b" ;;
+        esac
     fi
+    log "Selected mode: $MODE"
 fi
-log "Mode: $MODE"
 
 # === 8. RESOLVE TARGET & SWAP ===
 if [[ "$MODE" == "production" ]]; then

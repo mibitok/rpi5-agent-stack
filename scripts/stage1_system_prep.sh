@@ -41,48 +41,70 @@ fi
 log "Network connectivity test..."
 ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || die "No internet connection. Aborting."
 
-# === 2. STORAGE AUTO-DETECTION (FIXED) ===
+# === 2. STORAGE AUTO-DETECTION (SAFE & FIXED) ===
 log "Scanning block devices..."
-ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's|/dev/||')
 
-# Функция для конвертации размера в ГБ (примерно)
-size_to_gb() {
-    local size_str="$1"
+# Получаем имя корневого устройства (без /dev/ и без номера раздела)
+ROOT_DISK=$(findmnt -n -o SOURCE / | sed 's|/dev/||' | sed 's|p*[0-9]*$||')
+log "Root disk detected: $ROOT_DISK (will be excluded from formatting)"
+
+# Функция: конвертирует человеческий размер (64G, 500M) в ГБ (число)
+parse_size_to_gb() {
+    local input="$1"
     local num unit
-    num=$(echo "$size_str" | grep -oE '^[0-9.]+')
-    unit=$(echo "$size_str" | grep -oE '[KMGTP]i?B?$' | tr -d 'B')
+    # Извлекаем число и единицу
+    num=$(echo "$input" | grep -oE '^[0-9.]+' | head -1)
+    unit=$(echo "$input" | grep -oE '[KMGTP]i?$' | tr -d 'i' | tr '[:lower:]' '[:upper:]')
+    
+    # Если нет единицы — считаем, что это уже ГБ
+    [[ -z "$unit" ]] && { printf "%.0f" "$num" 2>/dev/null || echo "0"; return; }
+    
     case "$unit" in
-        K|ki) echo "$num / 1048576" | bc ;;
-        M|Mi) echo "$num / 1024" | bc ;;
-        G|Gi|'') printf "%.0f" "$num" ;;  # G или без единицы = уже в ГБ
-        T|Ti) echo "$num * 1024" | bc ;;
+        K) echo "$num / 1048576" | bc -l 2>/dev/null || echo "0" ;;
+        M) echo "$num / 1024" | bc -l 2>/dev/null || echo "0" ;;
+        G) printf "%.0f" "$num" 2>/dev/null || echo "0" ;;
+        T) echo "$num * 1024" | bc -l 2>/dev/null || echo "0" ;;
         *) echo "0" ;;
     esac
 }
-export -f size_to_gb
 
-# Получаем список дисков в формате: name size_in_gb
-readarray -t DRIVES < <(lsblk -dnbo NAME,SIZE,RO,TYPE 2>/dev/null | while read -r name size ro type; do
-    # Пропускаем: root-диск, read-only, не disk, размер < 10 ГБ
-    [[ "$name" == "$ROOT_DEV" ]] && continue
+# Сканируем диски: NAME, SIZE (human), TYPE, RO
+readarray -t DRIVES < <(lsblk -dn -o NAME,SIZE,TYPE,RO 2>/dev/null | while read -r name size type ro; do
+    # Пропускаем корневой диск
+    [[ "$name" == "$ROOT_DISK" ]] && continue
+    # Только type=disk
     [[ "$type" != "disk" ]] && continue
-    [[ "$ro" == "1" ]] && continue
-    
-    size_gb=$(size_to_gb "$size")
+    # Только read-write (RO=0)
+    [[ "$ro" != "0" ]] && continue
+    # Конвертируем размер и фильтруем <10 ГБ
+    size_gb=$(parse_size_to_gb "$size")
     [[ -z "$size_gb" || "$size_gb" -lt 10 ]] && continue
     
     echo "$name ${size_gb}G"
 done)
 
+# Логирование для отладки
+log "Detected candidate drives: ${DRIVES[*]:-none}"
+
 if [[ ${#DRIVES[@]} -eq 0 ]]; then
-    log "Available block devices:"
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | tee -a "$LOG_FILE"
-    die "No suitable external storage (>10GB, read-write, type=disk) found. Connect NVMe/SSD/USB."
+    log "=== Available block devices ==="
+    lsblk -o NAME,SIZE,TYPE,RO,MOUNTPOINT 2>/dev/null | tee -a "$LOG_FILE"
+    log "==============================="
+    die "No suitable external storage (>10GB, read-write, type=disk, non-root) found. Connect NVMe/SSD/USB."
 fi
 
 TARGET_DEV=$(echo "${DRIVES[0]}" | awk '{print $1}')
 TARGET_SIZE=$(echo "${DRIVES[0]}" | awk '{print $2}')
-log "Selected storage: $TARGET_DEV ($TARGET_SIZE)"
+log "✅ Selected storage for formatting: $TARGET_DEV ($TARGET_SIZE)"
+
+# Дополнительная защита: явный запрет на системные устройства
+case "$TARGET_DEV" in
+    mmcblk0|mmcblk1|sda|nvme0n1)
+        if [[ "$TARGET_DEV" == "$ROOT_DISK" ]]; then
+            die "SECURITY: Refusing to format root device $TARGET_DEV. Aborting."
+        fi
+        ;;
+esac
 # === 3. FORMAT & MOUNT ===
 PARTITION="${TARGET_DEV}1"
 if mountpoint -q "$DATA_MOUNT" 2>/dev/null; then

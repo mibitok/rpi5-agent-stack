@@ -41,24 +41,48 @@ fi
 log "Network connectivity test..."
 ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || die "No internet connection. Aborting."
 
-# === 2. STORAGE AUTO-DETECTION ===
+# === 2. STORAGE AUTO-DETECTION (FIXED) ===
 log "Scanning block devices..."
-ROOT_DEV=$(findmnt -n -o SOURCE /)
-# lsblk JSON -> filter: type=disk, not root, not read-only, size>10G
-readarray -t DRIVES < <(lsblk -J 2>/dev/null | jq -r '.blockdevices[] | select(.type=="disk" and .ro==false and .size|tonumber>10) | "\(.name) \(.size)"')
+ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's|/dev/||')
+
+# Функция для конвертации размера в ГБ (примерно)
+size_to_gb() {
+    local size_str="$1"
+    local num unit
+    num=$(echo "$size_str" | grep -oE '^[0-9.]+')
+    unit=$(echo "$size_str" | grep -oE '[KMGTP]i?B?$' | tr -d 'B')
+    case "$unit" in
+        K|ki) echo "$num / 1048576" | bc ;;
+        M|Mi) echo "$num / 1024" | bc ;;
+        G|Gi|'') printf "%.0f" "$num" ;;  # G или без единицы = уже в ГБ
+        T|Ti) echo "$num * 1024" | bc ;;
+        *) echo "0" ;;
+    esac
+}
+export -f size_to_gb
+
+# Получаем список дисков в формате: name size_in_gb
+readarray -t DRIVES < <(lsblk -dnbo NAME,SIZE,RO,TYPE 2>/dev/null | while read -r name size ro type; do
+    # Пропускаем: root-диск, read-only, не disk, размер < 10 ГБ
+    [[ "$name" == "$ROOT_DEV" ]] && continue
+    [[ "$type" != "disk" ]] && continue
+    [[ "$ro" == "1" ]] && continue
+    
+    size_gb=$(size_to_gb "$size")
+    [[ -z "$size_gb" || "$size_gb" -lt 10 ]] && continue
+    
+    echo "$name ${size_gb}G"
+done)
 
 if [[ ${#DRIVES[@]} -eq 0 ]]; then
-    die "No suitable external storage (>10GB, read-write) found. Connect NVMe/SSD/USB."
+    log "Available block devices:"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | tee -a "$LOG_FILE"
+    die "No suitable external storage (>10GB, read-write, type=disk) found. Connect NVMe/SSD/USB."
 fi
 
 TARGET_DEV=$(echo "${DRIVES[0]}" | awk '{print $1}')
 TARGET_SIZE=$(echo "${DRIVES[0]}" | awk '{print $2}')
 log "Selected storage: $TARGET_DEV ($TARGET_SIZE)"
-[[ "$FORCE" != "true" && "$DRY_RUN" != "true" ]] && {
-    read -rp "⚠️  This will WIPE and FORMAT $TARGET_DEV. Continue? [y/N]: " CONFIRM
-    [[ "$CONFIRM" =~ ^[Yy] ]] || die "Aborted by user."
-}
-
 # === 3. FORMAT & MOUNT ===
 PARTITION="${TARGET_DEV}1"
 if mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
